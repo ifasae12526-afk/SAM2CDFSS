@@ -61,7 +61,8 @@ def build_model(args: argparse.Namespace) -> nn.Module:
     return model
 
 
-def dice_loss(logits: torch.Tensor, target: torch.Tensor, smooth: float = 1.0) -> torch.Tensor:
+def dice_loss(logits: torch.Tensor, target: torch.Tensor, smooth: float = 1.0,
+              ignore_index: int = 255) -> torch.Tensor:
     """Soft Dice loss for 2-class segmentation (bg/fg).
 
     Dice is inherently balanced across classes and does not suffer from
@@ -69,8 +70,9 @@ def dice_loss(logits: torch.Tensor, target: torch.Tensor, smooth: float = 1.0) -
 
     Args:
         logits: (B,2,H,W) raw model output
-        target: (B,H,W) long with values {0,1}
+        target: (B,H,W) long with values {0,1,255}
         smooth: Laplace smoothing to avoid division by zero
+        ignore_index: label value to ignore (e.g. 255 for boundaries)
 
     Returns:
         Scalar dice loss (1 - mean_dice).
@@ -78,6 +80,11 @@ def dice_loss(logits: torch.Tensor, target: torch.Tensor, smooth: float = 1.0) -
     probs = F.softmax(logits, dim=1)            # (B,2,H,W)
     fg_prob = probs[:, 1]                        # (B,H,W) – foreground probability
     fg_gt = (target == 1).float()                # (B,H,W)
+    valid = (target != ignore_index).float()     # (B,H,W)
+
+    # Only compute dice over valid (non-ignored) pixels
+    fg_prob = fg_prob * valid
+    fg_gt = fg_gt * valid
 
     intersection = (fg_prob * fg_gt).sum(dim=(1, 2))          # (B,)
     cardinality = fg_prob.sum(dim=(1, 2)) + fg_gt.sum(dim=(1, 2))  # (B,)
@@ -105,7 +112,10 @@ def focal_ce_loss(
 
     # Per-pixel pt (probability of the correct class)
     probs = F.softmax(logits, dim=1)  # (B,2,H,W)
-    pt = probs.gather(1, target.clamp(0).unsqueeze(1)).squeeze(1)  # (B,H,W)
+    num_classes = logits.shape[1]
+    # Clamp to valid class range to avoid gather OOB (ignore pixels have target=255)
+    target_safe = target.clamp(0, num_classes - 1)
+    pt = probs.gather(1, target_safe.unsqueeze(1)).squeeze(1)  # (B,H,W)
 
     # Focal modulation
     focal_weight = (1.0 - pt) ** gamma
