@@ -60,8 +60,72 @@ def build_model(args: argparse.Namespace) -> nn.Module:
     return model
 
 
-def compute_ce_loss(logits: torch.Tensor, batch: dict) -> torch.Tensor:
+def dice_loss(logits: torch.Tensor, target: torch.Tensor, smooth: float = 1.0) -> torch.Tensor:
+    """Soft Dice loss for 2-class segmentation (bg/fg).
+
+    Dice is inherently balanced across classes and does not suffer from
+    the class-imbalance problem that causes all-background collapse.
+
+    Args:
+        logits: (B,2,H,W) raw model output
+        target: (B,H,W) long with values {0,1}
+        smooth: Laplace smoothing to avoid division by zero
+
+    Returns:
+        Scalar dice loss (1 - mean_dice).
     """
+    probs = F.softmax(logits, dim=1)            # (B,2,H,W)
+    fg_prob = probs[:, 1]                        # (B,H,W) – foreground probability
+    fg_gt = (target == 1).float()                # (B,H,W)
+
+    intersection = (fg_prob * fg_gt).sum(dim=(1, 2))          # (B,)
+    cardinality = fg_prob.sum(dim=(1, 2)) + fg_gt.sum(dim=(1, 2))  # (B,)
+    dice = (2.0 * intersection + smooth) / (cardinality + smooth)  # (B,)
+    return 1.0 - dice.mean()
+
+
+def focal_ce_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    gamma: float = 2.0,
+    alpha_fg: float = 0.75,
+    ignore_index: int = 255,
+) -> torch.Tensor:
+    """Focal cross-entropy loss – down-weights easy (background) pixels.
+
+    Args:
+        logits: (B,2,H,W)
+        target: (B,H,W) long {0,1,255}
+        gamma:  focusing parameter (higher -> more focus on hard examples)
+        alpha_fg: weight for the foreground class (>0.5 = boost fg)
+    """
+    # Per-pixel CE (unreduced)
+    ce = F.cross_entropy(logits, target, ignore_index=ignore_index, reduction="none")  # (B,H,W)
+
+    # Per-pixel pt (probability of the correct class)
+    probs = F.softmax(logits, dim=1)  # (B,2,H,W)
+    pt = probs.gather(1, target.clamp(0).unsqueeze(1)).squeeze(1)  # (B,H,W)
+
+    # Focal modulation
+    focal_weight = (1.0 - pt) ** gamma
+
+    # Alpha weighting: give foreground pixels more weight
+    alpha = torch.where(target == 1, alpha_fg, 1.0 - alpha_fg)  # (B,H,W)
+
+    # Mask out ignored pixels
+    valid = (target != ignore_index).float()
+    loss = (alpha * focal_weight * ce * valid).sum() / valid.sum().clamp(min=1.0)
+    return loss
+
+
+def compute_ce_loss(logits: torch.Tensor, batch: dict) -> torch.Tensor:
+    """Combined loss: Focal-CE + Dice.
+
+    Dice loss handles extreme class imbalance (e.g. small foreground objects)
+    by treating each class equally regardless of pixel count.
+    Focal-CE down-weights easy background pixels so the gradient signal is
+    dominated by hard foreground pixels.
+
     logits: (B,2,H,W)
     query_mask: (B,H,W) float {0,1} or long
     query_ignore_idx: (B,H,W) float {0,1} (optional) -> ignored as 255
@@ -77,7 +141,14 @@ def compute_ce_loss(logits: torch.Tensor, batch: dict) -> torch.Tensor:
         target = target.clone()
         target[ignore] = 255
 
-    return F.cross_entropy(logits, target, ignore_index=255)
+    # Focal CE (handles class imbalance via alpha + focal modulation)
+    loss_focal = focal_ce_loss(logits, target, gamma=2.0, alpha_fg=0.75)
+
+    # Dice loss (inherently balanced, prevents all-background collapse)
+    loss_dice = dice_loss(logits, target)
+
+    # Combined: both terms are roughly in [0, 1] range
+    return loss_focal + loss_dice
 
 
 def run_epoch(
@@ -192,7 +263,7 @@ def main() -> None:
     parser.add_argument("--wd", type=float, default=5e-4)
     parser.add_argument("--niter", type=int, default=2000)
     parser.add_argument("--amp", action="store_true", help="Use torch.cuda.amp mixed precision")
-    parser.add_argument("--aux_weight", type=float, default=0.2, help="Deep supervision weight for branch-A/branch-B logits. Set 0 to disable.")
+    parser.add_argument("--aux_weight", type=float, default=0.5, help="Deep supervision weight for branch-A/branch-B logits. Set 0 to disable (NOT recommended for small-fg datasets).")
     parser.add_argument("--grad_clip", type=float, default=0.5)
 
     # Runtime
