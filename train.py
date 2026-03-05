@@ -173,7 +173,8 @@ def run_epoch(
     scaler: GradScaler | None,
     aux_weight: float,
     write_batch_idx: int,
-    grad_clip: float
+    grad_clip: float,
+    label: str = "",
 ) -> tuple[float, float, float]:
     """
     Returns:
@@ -239,7 +240,8 @@ def run_epoch(
 
         average_meter.write_process(idx, len(dataloader), epoch, write_batch_idx=write_batch_idx)
 
-    average_meter.write_result("Training" if training else "Validation", epoch)
+    tag = label if label else ("Training" if training else "Validation")
+    average_meter.write_result(tag, epoch)
     avg_loss = utils.mean(average_meter.loss_buf)
     miou, fb_iou = average_meter.compute_iou()
     return float(avg_loss), float(miou), float(fb_iou)
@@ -260,9 +262,11 @@ def main() -> None:
     parser.add_argument("--benchmark_train", type=str, default="pascal", choices=["pascal", "fss", "deepglobe", "isic", "lung", "chick"])
     parser.add_argument("--benchmark_val", type=str, default="fss", choices=["pascal", "fss", "deepglobe", "isic", "lung", "chick"])
     parser.add_argument("--split_val", type=str, default="val", choices=["val", "test"])
+    parser.add_argument("--benchmark_train_aux", type=str, default="", choices=["", "pascal", "fss", "deepglobe", "isic", "lung", "chick"], help="Auxiliary training benchmark (mixed-domain). Empty = disabled.")
     parser.add_argument("--fold", type=int, default=4, choices=[0, 1, 2, 3, 4], help="PASCAL-5i fold. Use 4 to train on all 20 classes.")
     parser.add_argument("--val_fold", type=int, default=0, choices=[0, 1, 2, 3, 4])
     parser.add_argument("--train_shot", type=int, default=1)
+    parser.add_argument("--aux_shot", type=int, default=5, help="Shot for auxiliary training benchmark")
     parser.add_argument("--val_shot", type=int, default=1)
     parser.add_argument("--datapath_src", type=str, default="../VOCdevkit", help="Path to VOCdevkit (contains VOC2012/).")
     parser.add_argument("--datapath_tgt", type=str, default="../CDFSL", help="Path containing target datasets (FSS-1000/, Deepglobe/, ISIC/, LungSegmentation/).")
@@ -309,7 +313,7 @@ def main() -> None:
     scaler = GradScaler(enabled=args.amp)
 
     # Build dataloaders
-    # Train dataset
+    # ── Primary train dataset ──
     datapath_train = args.datapath_src if args.benchmark_train == "pascal" else args.datapath_tgt
     FSSDataset.initialize(img_size=args.img_size, datapath=datapath_train,
                           episodes_per_epoch=args.episodes_per_epoch)
@@ -317,7 +321,18 @@ def main() -> None:
         args.benchmark_train, args.bsz, args.nworker, args.fold, "trn", shot=args.train_shot
     )
 
-    # Val dataset
+    # ── Auxiliary train dataset (mixed-domain) ──
+    dataloader_trn_aux = None
+    if args.benchmark_train_aux:
+        datapath_aux = args.datapath_src if args.benchmark_train_aux == "pascal" else args.datapath_tgt
+        FSSDataset.initialize(img_size=args.img_size, datapath=datapath_aux,
+                              episodes_per_epoch=args.episodes_per_epoch)
+        dataloader_trn_aux = FSSDataset.build_dataloader(
+            args.benchmark_train_aux, args.bsz, args.nworker, 0, "trn", shot=args.aux_shot
+        )
+        Logger.info(f"Mixed-domain: primary={args.benchmark_train} + aux={args.benchmark_train_aux}")
+
+    # ── Val dataset ──
     datapath_val = args.datapath_src if args.benchmark_val == "pascal" else args.datapath_tgt
     FSSDataset.initialize(img_size=args.img_size, datapath=datapath_val)
     dataloader_val = FSSDataset.build_dataloader(
@@ -340,23 +355,37 @@ def main() -> None:
             for pg in optimizer.param_groups:
                 pg['lr'] = warmup_lr
 
+        # ── Phase 1: Primary training (e.g. Pascal) ──
         trn_loss, trn_miou, trn_fb_iou = run_epoch(
             epoch, model, dataloader_trn, optimizer,
             training=True, amp=args.amp, scaler=scaler,
             aux_weight=args.aux_weight, write_batch_idx=args.write_batch_idx,
             grad_clip=args.grad_clip,
+            label=f"Train-{args.benchmark_train}",
         )
+
+        # ── Phase 2: Auxiliary training (e.g. Chick) ──
+        if dataloader_trn_aux is not None:
+            aux_loss, aux_miou, aux_fb_iou = run_epoch(
+                epoch, model, dataloader_trn_aux, optimizer,
+                training=True, amp=args.amp, scaler=scaler,
+                aux_weight=args.aux_weight, write_batch_idx=args.write_batch_idx,
+                grad_clip=args.grad_clip,
+                label=f"Train-{args.benchmark_train_aux}",
+            )
 
         # Step scheduler after warmup
         if epoch >= args.warmup_epochs:
             scheduler.step()
 
+        # ── Phase 3: Validation ──
         with torch.no_grad():
             val_loss, val_miou, val_fb_iou = run_epoch(
                 epoch, model, dataloader_val, optimizer=None,
                 training=False, amp=args.amp, scaler=None,
                 aux_weight=0.0, write_batch_idx=max(1, args.write_batch_idx // 5),
                 grad_clip=0.0,
+                label=f"Val-{args.benchmark_val}",
             )
 
         # Save best by mIoU
@@ -374,6 +403,9 @@ def main() -> None:
         Logger.tbd_writer.add_scalars("loss", {"trn": trn_loss, "val": val_loss}, epoch)
         Logger.tbd_writer.add_scalars("miou", {"trn": trn_miou, "val": val_miou}, epoch)
         Logger.tbd_writer.add_scalars("fb_iou", {"trn": trn_fb_iou, "val": val_fb_iou}, epoch)
+        if dataloader_trn_aux is not None:
+            Logger.tbd_writer.add_scalars("loss_aux", {"trn_aux": aux_loss}, epoch)
+            Logger.tbd_writer.add_scalars("miou_aux", {"trn_aux": aux_miou}, epoch)
         Logger.tbd_writer.flush()
 
         elapsed = time.time() - start_time
