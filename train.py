@@ -273,6 +273,7 @@ def main() -> None:
 
     # Optimization
     parser.add_argument("--bsz", type=int, default=2)
+    parser.add_argument("--bsz_aux", type=int, default=0, help="Batch size for auxiliary training. 0 = same as --bsz.")
     parser.add_argument("--bsz_val", type=int, default=2)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--wd", type=float, default=5e-4)
@@ -327,8 +328,9 @@ def main() -> None:
         datapath_aux = args.datapath_src if args.benchmark_train_aux == "pascal" else args.datapath_tgt
         FSSDataset.initialize(img_size=args.img_size, datapath=datapath_aux,
                               episodes_per_epoch=args.episodes_per_epoch)
+        bsz_aux = args.bsz_aux if args.bsz_aux > 0 else args.bsz
         dataloader_trn_aux = FSSDataset.build_dataloader(
-            args.benchmark_train_aux, args.bsz, args.nworker, 0, "trn", shot=args.aux_shot
+            args.benchmark_train_aux, bsz_aux, args.nworker, 0, "trn", shot=args.aux_shot
         )
         Logger.info(f"Mixed-domain: primary={args.benchmark_train} + aux={args.benchmark_train_aux}")
 
@@ -366,6 +368,7 @@ def main() -> None:
 
         # ── Phase 2: Auxiliary training (e.g. Chick) ──
         if dataloader_trn_aux is not None:
+            torch.cuda.empty_cache()
             aux_loss, aux_miou, aux_fb_iou = run_epoch(
                 epoch, model, dataloader_trn_aux, optimizer,
                 training=True, amp=args.amp, scaler=scaler,
@@ -379,6 +382,7 @@ def main() -> None:
             scheduler.step()
 
         # ── Phase 3: Validation ──
+        torch.cuda.empty_cache()
         with torch.no_grad():
             val_loss, val_miou, val_fb_iou = run_epoch(
                 epoch, model, dataloader_val, optimizer=None,
