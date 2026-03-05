@@ -28,6 +28,8 @@ def default_tfi_lr(benchmark: str) -> float:
         return 1e-3
     if benchmark in {"fss", "lung"}:
         return 5e-5
+    if benchmark in {"chick"}:
+        return 5e-4
     return 1e-3
 
 

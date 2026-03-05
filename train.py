@@ -29,6 +29,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.cuda.amp import GradScaler, autocast
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 
 from cdfss.sam2unet_cdfss_aggressive import SAM2CDFSSConfig, SAM2UNetCDFSSAggressive
 
@@ -265,6 +266,11 @@ def main() -> None:
     parser.add_argument("--amp", action="store_true", help="Use torch.cuda.amp mixed precision")
     parser.add_argument("--aux_weight", type=float, default=0.5, help="Deep supervision weight for branch-A/branch-B logits. Set 0 to disable (NOT recommended for small-fg datasets).")
     parser.add_argument("--grad_clip", type=float, default=0.5)
+    parser.add_argument("--warmup_epochs", type=int, default=20, help="Linear warmup epochs")
+    parser.add_argument("--cosine_T0", type=int, default=100, help="CosineAnnealingWarmRestarts T_0")
+    parser.add_argument("--cosine_Tmult", type=int, default=2, help="CosineAnnealingWarmRestarts T_mult")
+    parser.add_argument("--lr_min", type=float, default=1e-6, help="Minimum LR for cosine schedule")
+    parser.add_argument("--episodes_per_epoch", type=int, default=200, help="Virtual episodes per epoch for small datasets (chick)")
 
     # Runtime
     parser.add_argument("--nworker", type=int, default=4)
@@ -295,7 +301,8 @@ def main() -> None:
     # Build dataloaders
     # Train dataset
     datapath_train = args.datapath_src if args.benchmark_train == "pascal" else args.datapath_tgt
-    FSSDataset.initialize(img_size=args.img_size, datapath=datapath_train)
+    FSSDataset.initialize(img_size=args.img_size, datapath=datapath_train,
+                          episodes_per_epoch=args.episodes_per_epoch)
     dataloader_trn = FSSDataset.build_dataloader(
         args.benchmark_train, args.bsz, args.nworker, args.fold, "trn", shot=args.train_shot
     )
@@ -311,13 +318,28 @@ def main() -> None:
     best_val_loss = float("inf")
     start_time = time.time()
 
+    # LR Scheduler: cosine with warm restarts
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=args.cosine_T0,
+                                            T_mult=args.cosine_Tmult,
+                                            eta_min=args.lr_min)
+
     for epoch in range(args.niter):
+        # Linear warmup
+        if epoch < args.warmup_epochs:
+            warmup_lr = args.lr * (epoch + 1) / args.warmup_epochs
+            for pg in optimizer.param_groups:
+                pg['lr'] = warmup_lr
+
         trn_loss, trn_miou, trn_fb_iou = run_epoch(
             epoch, model, dataloader_trn, optimizer,
             training=True, amp=args.amp, scaler=scaler,
             aux_weight=args.aux_weight, write_batch_idx=args.write_batch_idx,
             grad_clip=args.grad_clip,
         )
+
+        # Step scheduler after warmup
+        if epoch >= args.warmup_epochs:
+            scheduler.step()
 
         with torch.no_grad():
             val_loss, val_miou, val_fb_iou = run_epoch(
