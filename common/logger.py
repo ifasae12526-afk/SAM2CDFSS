@@ -106,7 +106,7 @@ class Logger:
     @classmethod
     def initialize(cls, args, training):
         logtime = datetime.datetime.now().__format__('_%m%d_%H%M%S')
-        logpath = args.logpath if training else '_TEST_' + args.load.split('/')[-2].split('.')[0] + logtime
+        logpath = args.logpath if training else '_TEST_' + os.path.basename(os.path.dirname(args.load)).split('.')[0] + logtime
         if logpath == '': logpath = logtime
 
         cls.logpath = os.path.join('logs', logpath + '.log')
