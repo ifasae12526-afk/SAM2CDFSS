@@ -189,7 +189,7 @@ class PATAnchorTransform(nn.Module):
         G = G + ridge * I2
 
         # Solve: (C C^T + λI) X = R  -> X is (B,2,D)
-        X = torch.linalg.solve(G, R)
+        X = torch.linalg.solve(G.float(), R.float()).to(G.dtype)
 
         # P_pre = C^T X  -> (B,D,D)
         P = (C.transpose(1, 2) @ X)
